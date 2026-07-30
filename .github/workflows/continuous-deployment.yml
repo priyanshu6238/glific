@@ -75,4 +75,3 @@ jobs:
             --ci \
             --app "${{ secrets.GIGALIXIR_APPNAME }}" \
             --sha "${{ steps.deployed.outputs.sha }}"
-

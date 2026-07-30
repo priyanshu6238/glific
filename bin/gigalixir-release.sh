@@ -32,14 +32,13 @@ production|glific|production
 
 ENV_NAME="" APP="" REMOTE="" NEW_VERSION="" BUMP="" RELEASE_TITLE=""
 BASE_BRANCH="master" DRY_RUN=0 ASSUME_YES=0
-SKIP_RELEASE=0 SKIP_VERIFY=0
+SKIP_CI_WAIT=0 SKIP_RELEASE=0 SKIP_VERIFY=0
 STABLE_WINDOW=300
 
 CURRENT_VERSION="" VERSION_FILE="" PROJECT_KIND=""
 BRANCH="" PR_NUMBER="" DEPLOY_SHA=""
-DISCORD_WEBHOOK=""
 
-usage() { sed -n '2,19p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; }
+usage() { sed -n '2,21p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; }
 
 die() {
   printf '\n%s\n' "error: $*" >&2
@@ -78,23 +77,18 @@ abort() {
   exit 1
 }
 
-# A value-taking flag passed as the last token leaves no $2 to consume; `shift 2`
-# would then fail silently and the while-loop would spin on the same flag forever.
-# need "$@" asserts a value follows before we shift past it.
-need() { [ "$#" -ge 2 ] || die "missing value for $1"; }
-
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --env) need "$@"; ENV_NAME="$2"; shift 2 ;;
-      --app) need "$@"; APP="$2"; shift 2 ;;
-      --remote) need "$@"; REMOTE="$2"; shift 2 ;;
-      --version) need "$@"; NEW_VERSION="$2"; shift 2 ;;
-      --bump) need "$@"; BUMP="$2"; shift 2 ;;
-      --title) need "$@"; RELEASE_TITLE="$2"; shift 2 ;;
-      --base) need "$@"; BASE_BRANCH="$2"; shift 2 ;;
-      --stable-window) need "$@"; STABLE_WINDOW="$2"; shift 2 ;;
-      --discord-webhook) need "$@"; DISCORD_WEBHOOK="$2"; shift 2 ;;
+      --env) ENV_NAME="${2:-}"; shift 2 ;;
+      --app) APP="${2:-}"; shift 2 ;;
+      --remote) REMOTE="${2:-}"; shift 2 ;;
+      --version) NEW_VERSION="${2:-}"; shift 2 ;;
+      --bump) BUMP="${2:-}"; shift 2 ;;
+      --title) RELEASE_TITLE="${2:-}"; shift 2 ;;
+      --base) BASE_BRANCH="${2:-}"; shift 2 ;;
+      --stable-window) STABLE_WINDOW="${2:-}"; shift 2 ;;
+      --skip-ci-wait) SKIP_CI_WAIT=1; shift ;;
       --skip-release) SKIP_RELEASE=1; shift ;;
       --skip-verify) SKIP_VERIFY=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -177,7 +171,6 @@ next_version() {
     major) printf '%d.0.0' "$((major + 1))" ;;
     minor) printf '%d.%d.0' "$major" "$((minor + 1))" ;;
     patch) printf '%d.%d.%d' "$major" "$minor" "$((patch + 1))" ;;
-    *) die "invalid bump '${part}' (use patch, minor or major)" ;;
   esac
 }
 
@@ -209,15 +202,7 @@ choose_version() {
   git rev-parse -q --verify "refs/tags/v${NEW_VERSION}" >/dev/null \
     && die "tag v${NEW_VERSION} already exists locally"
 
-  # A leftover branch from an earlier aborted run would make `git checkout -b` fail;
-  # suffix -2, -3, ... until we find a name free both locally and on origin.
   BRANCH="chore/bump-version-${NEW_VERSION}"
-  local suffix=2
-  while git rev-parse --verify --quiet "refs/heads/${BRANCH}" >/dev/null \
-        || git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; do
-    BRANCH="chore/bump-version-${NEW_VERSION}-${suffix}"
-    suffix=$((suffix + 1))
-  done
 }
 
 # Rewrites only the first version line, then proves exactly one file and one line
@@ -285,6 +270,29 @@ EOF
   log "opened PR #${PR_NUMBER}"
 }
 
+wait_for_ci() {
+  [ "$SKIP_CI_WAIT" -eq 1 ] && { log "skipping CI wait (--skip-ci-wait)"; return 0; }
+  [ "$DRY_RUN" -eq 1 ] && { log "[dry-run] gh pr checks ${PR_NUMBER} --watch"; return 0; }
+
+  step "CI"
+  log "watching checks on PR #${PR_NUMBER} (ctrl-c is safe, the PR stays open)"
+
+  if gh pr checks "$PR_NUMBER" --watch --fail-fast; then
+    log "all checks passed"
+    return 0
+  fi
+
+  local rc=$?
+  # gh exits 8 when a PR simply has no checks configured, which is not a red build.
+  if [ "$rc" -eq 8 ]; then
+    log "no checks reported on this PR"
+    confirm "Continue without CI?" || abort "no CI checks"
+    return 0
+  fi
+
+  printf '\n  CI is red on PR #%s.\n' "$PR_NUMBER"
+  confirm "Continue anyway? (not recommended)" || abort "CI failed"
+}
 
 merge_pr() {
   step "Merge"
@@ -300,9 +308,7 @@ EOF
 
   confirm "Merge PR #${PR_NUMBER}?" || abort "declined at the merge step"
 
-  # Always --admin: a version-bump PR does not wait for CI/reviews. Requires admin or
-  run gh pr merge "$PR_NUMBER" --squash --delete-branch --admin \
-    || die "gh pr merge failed (need admin/bypass permission on ${BASE_BRANCH})"
+  run gh pr merge "$PR_NUMBER" --squash --delete-branch || die "gh pr merge failed"
 
   run git checkout "$BASE_BRANCH" || die "could not switch back to ${BASE_BRANCH}"
   run git pull --ff-only origin "$BASE_BRANCH" || die "git pull failed"
@@ -369,7 +375,7 @@ EOF
   fi
 
   log "pushing to ${REMOTE} - the Gigalixir build output follows, this takes a few minutes"
-  run git push "$REMOTE" "${BASE_BRANCH}:master" || die "git push to ${REMOTE} failed - nothing was deployed"
+  # run git push "$REMOTE" "${BASE_BRANCH}:master" || die "git push to ${REMOTE} failed - nothing was deployed"
 }
 
 verify() {
@@ -382,15 +388,8 @@ verify() {
     return 0
   fi
 
-  # Scope the webhook to just this subprocess via an inline assignment, so git/gh (and
-  # anything they spawn) never inherit it. With no --discord-webhook, fall through to
-  # whatever DISCORD_WEBHOOK_URL is already in the environment.
-  local vargs=(--app "$APP" --sha "$DEPLOY_SHA" --app-version "$NEW_VERSION" --stable-window "$STABLE_WINDOW")
-  if [ -n "$DISCORD_WEBHOOK" ]; then
-    DISCORD_WEBHOOK_URL="$DISCORD_WEBHOOK" "$VERIFIER" "${vargs[@]}"
-  else
-    "$VERIFIER" "${vargs[@]}"
-  fi
+  "$VERIFIER" --app "$APP" --sha "$DEPLOY_SHA" --app-version "$NEW_VERSION" \
+    --stable-window "$STABLE_WINDOW"
   local rc=$?
 
   if [ "$rc" -ne 0 ]; then
@@ -423,23 +422,13 @@ main() {
   detect_project
   [ "$DRY_RUN" -eq 1 ] && printf '\n*** DRY RUN - nothing will be changed, pushed or deployed ***\n'
   preflight
-
-  # Only production is a versioned release (bump -> PR -> merge -> GitHub release).
-  # staging / frontend-staging just deploy the current master and verify - no ceremony.
-  if [ "$ENV_NAME" = "production" ]; then
-    choose_version
-    open_pr
-    merge_pr
-    create_release
-  else
-    DEPLOY_SHA=$(git rev-parse HEAD)
-    NEW_VERSION="$CURRENT_VERSION"
-    step "Version"
-    log "no bump for ${ENV_NAME} - deploying current ${BASE_BRANCH} (${DEPLOY_SHA:0:7}) as ${CURRENT_VERSION}"
-  fi
-
-  deploy
-  verify
+  choose_version
+  open_pr
+  wait_for_ci
+  merge_pr
+  create_release
+  # deploy
+  # verify
 }
 
 main "$@"

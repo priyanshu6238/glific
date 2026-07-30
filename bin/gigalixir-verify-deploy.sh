@@ -21,22 +21,22 @@
 #
 # Exit codes
 #   0 verified   2 release never appeared   3 never converged   4 rolled back
-#   5 unhealthy  6 superseded by a newer release
+#   5 unhealthy  6 http check failed        7 superseded by a newer release
 #   1 usage / precondition failure
 
 set -uo pipefail
 
 readonly E_OK=0 E_USAGE=1 E_NO_RELEASE=2 E_NO_CONVERGE=3
-readonly E_ROLLBACK=4 E_UNHEALTHY=5 E_SUPERSEDED=6
+readonly E_ROLLBACK=4 E_UNHEALTHY=5 E_HTTP=6 E_SUPERSEDED=7
 
 # --------------------------------------------------------------------------------------
 # Deploy targets. Add a row here rather than editing the script body.
-#   env|app name|git remote
+#   env|app name|git remote|health url ("" derives https://<app>.gigalixirapp.com/)
 # --------------------------------------------------------------------------------------
 readonly TARGETS="
-staging|glific-staging|staging
-frontend-staging|glific-frontend-staging|gigalixir
-production|glific|production
+staging|glific-staging|staging|
+frontend-staging|glific-frontend-staging|gigalixir|
+production|glific|production|
 "
 
 # --------------------------------------------------------------------------------------
@@ -54,12 +54,12 @@ readonly JQ_POD_STATUS='((.status // .Status // "") | tostring)'
 readonly JQ_POD_VER='((.version // .Version // "") | tostring)'
 readonly HEALTHY_RE='^(healthy|running)$'
 
-ENV_NAME="" APP="" SHA="" APP_VERSION=""
+ENV_NAME="" APP="" SHA="" APP_VERSION="" URL=""
 POLL=5 RELEASE_TIMEOUT=300 CONVERGE_TIMEOUT=300 STABLE_WINDOW=300
-FLAP_TOLERANCE=3
-CI_MODE=0 DEBUG=0 PROBE=0
+FLAP_TOLERANCE=3 EXPECT_STATUS=200
+CI_MODE=0 DEBUG=0 PROBE=0 HTTP_CHECK=1
 
-usage() { sed -n '2,25p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; }
+usage() { sed -n '2,30p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'; }
 
 die() {
   printf '%s\n' "error: $*" >&2
@@ -78,59 +78,29 @@ fail_annotation() {
   return 0
 }
 
-# Posts a Discord embed, falling back to nothing if no webhook is set. $1=ok|fail,
-# $2=reason (failures only). Success stays terse - a 🟢 title and the facts; failures
-# carry the reason. Reads APP / SHA / TARGET_VERSION / POD_NODE from the surrounding run.
 notify() {
+  local text="$1"
   [ -n "${DISCORD_WEBHOOK_URL:-}" ] || return 0
-  local kind="$1" desc="${2:-}" color title
-  case "$kind" in
-    ok) color=3066993; title="🟢 ${APP} deployment healthy" ;;
-    fail) color=15158332; title="🔴 ${APP} deployment failed" ;;
-    *) color=9807270; title="${APP} deployment" ;;
-  esac
-
-  local payload
-  payload=$(jq -nc \
-    --arg title "$title" \
-    --arg desc "$desc" \
-    --argjson color "$color" \
-    --arg sha "${SHA:0:7}" \
-    --arg rel "${TARGET_VERSION:-unknown}" \
-    --arg node "${POD_NODE:-unknown}" \
-    --arg ts "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    '{embeds:[
-       ({ title: $title, color: $color, timestamp: $ts,
-          fields: [
-            {name: "Release", value: $rel,  inline: true},
-            {name: "SHA",     value: $sha,  inline: true},
-            {name: "Node",    value: $node, inline: false}
-          ]
-        } + (if $desc == "" then {} else {description: $desc} end))
-     ]}')
-
   curl -fsS -m 10 -X POST "$DISCORD_WEBHOOK_URL" \
     -H 'Content-Type: application/json' \
-    --data "$payload" >/dev/null 2>&1 || true
+    --data "$(jq -nc --arg c "$text" '{content: $c}')" >/dev/null 2>&1 || true
 }
-
-# A value-taking flag passed as the last token leaves no $2 to consume; `shift 2`
-# would then fail silently and the while-loop would spin on the same flag forever.
-# need "$@" asserts a value follows before we shift past it.
-need() { [ "$#" -ge 2 ] || die "missing value for $1"; }
 
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --env) need "$@"; ENV_NAME="$2"; shift 2 ;;
-      --app) need "$@"; APP="$2"; shift 2 ;;
-      --sha) need "$@"; SHA="$2"; shift 2 ;;
-      --app-version) need "$@"; APP_VERSION="$2"; shift 2 ;;
-      --poll) need "$@"; POLL="$2"; shift 2 ;;
-      --release-timeout) need "$@"; RELEASE_TIMEOUT="$2"; shift 2 ;;
-      --converge-timeout) need "$@"; CONVERGE_TIMEOUT="$2"; shift 2 ;;
-      --stable-window) need "$@"; STABLE_WINDOW="$2"; shift 2 ;;
-      --flap-tolerance) need "$@"; FLAP_TOLERANCE="$2"; shift 2 ;;
+      --env) ENV_NAME="${2:-}"; shift 2 ;;
+      --app) APP="${2:-}"; shift 2 ;;
+      --sha) SHA="${2:-}"; shift 2 ;;
+      --app-version) APP_VERSION="${2:-}"; shift 2 ;;
+      --url) URL="${2:-}"; shift 2 ;;
+      --poll) POLL="${2:-}"; shift 2 ;;
+      --release-timeout) RELEASE_TIMEOUT="${2:-}"; shift 2 ;;
+      --converge-timeout) CONVERGE_TIMEOUT="${2:-}"; shift 2 ;;
+      --stable-window) STABLE_WINDOW="${2:-}"; shift 2 ;;
+      --flap-tolerance) FLAP_TOLERANCE="${2:-}"; shift 2 ;;
+      --expect-status) EXPECT_STATUS="${2:-}"; shift 2 ;;
+      --no-http) HTTP_CHECK=0; shift ;;
       --ci) CI_MODE=1; shift ;;
       --debug) DEBUG=1; shift ;;
       --probe) PROBE=1; shift ;;
@@ -145,9 +115,11 @@ resolve_target() {
     local row
     row=$(printf '%s' "$TARGETS" | grep "^${ENV_NAME}|") || die "unknown --env '$ENV_NAME'"
     [ -n "$APP" ] || APP=$(printf '%s' "$row" | cut -d'|' -f2)
+    [ -n "$URL" ] || URL=$(printf '%s' "$row" | cut -d'|' -f4)
   fi
 
   [ -n "$APP" ] || die "need --app or --env (one of: staging frontend-staging production)"
+  [ -n "$URL" ] || URL="https://${APP}.gigalixirapp.com/"
 
   if [ -z "$SHA" ]; then
     SHA=$(git rev-parse HEAD 2>/dev/null) || die "not in a git repo; pass --sha explicitly"
@@ -165,26 +137,18 @@ preflight() {
   [ "$POLL" -ge 1 ] || die "--poll must be at least 1"
 }
 
-# The gigalixir CLI prepends a "new version available" banner to stdout, which is not
-# JSON and makes jq choke. Print from the first line that *starts* with [ or { (the JSON
-# opening) onward. Anchoring to the line start avoids matching a banner like
-# "update [1.2.3] available", whose bracket sits mid-line.
-strip_banner() {
-  sed -n '/^[[:space:]]*[[{]/,$p'
-}
-
 # Both fetchers echo raw JSON on stdout and return non-zero if the CLI failed or the
 # payload was not JSON, so a transient API blip is a skipped poll rather than a crash.
 fetch_releases() {
   local out
-  out=$(gigalixir releases -a "$APP" 2>/dev/null | strip_banner) || return 1
+  out=$(gigalixir releases -a "$APP" 2>/dev/null) || return 1
   printf '%s' "$out" | jq -e . >/dev/null 2>&1 || return 1
   printf '%s' "$out"
 }
 
 fetch_ps() {
   local out
-  out=$(gigalixir ps -a "$APP" 2>/dev/null | strip_banner) || return 1
+  out=$(gigalixir ps -a "$APP" 2>/dev/null) || return 1
   printf '%s' "$out" | jq -e . >/dev/null 2>&1 || return 1
   printf '%s' "$out"
 }
@@ -225,6 +189,16 @@ replica_counts() {
   printf '%s' "$1" | jq -r '[(.replicas_running // -1), (.replicas_desired // -1)] | @tsv' 2>/dev/null
 }
 
+http_ok() {
+  [ "$HTTP_CHECK" -eq 1 ] || return 0
+  local code
+  # The XFP header dodges the http->https 301 in the frontend's nginx config so a broken
+  # upstream surfaces as 502 instead of hiding behind a redirect.
+  code=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' \
+    -H 'X-Forwarded-Proto: https' "$URL" 2>/dev/null) || return 1
+  [ "$code" = "$EXPECT_STATUS" ]
+}
+
 # Reads pod state once. Sets POD_SUMMARY / POD_TOTAL / POD_AT_TARGET / POD_HEALTHY_AT_TARGET
 # / POD_BEHIND / POD_AHEAD. Returns non-zero if the API call itself failed.
 inspect_pods() {
@@ -238,7 +212,7 @@ inspect_pods() {
   desired=$(printf '%s' "$counts" | cut -f2)
 
   POD_TOTAL=0 POD_AT_TARGET=0 POD_HEALTHY_AT_TARGET=0 POD_BEHIND=0 POD_AHEAD=0
-  POD_SUMMARY="" POD_NODE=""
+  POD_SUMMARY=""
 
   local name status version status_lc
   while IFS=$'\t' read -r name status version; do
@@ -249,10 +223,7 @@ inspect_pods() {
 
     if [ "$version" = "$target" ]; then
       POD_AT_TARGET=$((POD_AT_TARGET + 1))
-      if [[ "$status_lc" =~ $HEALTHY_RE ]]; then
-        POD_HEALTHY_AT_TARGET=$((POD_HEALTHY_AT_TARGET + 1))
-        POD_NODE="$name"
-      fi
+      [[ "$status_lc" =~ $HEALTHY_RE ]] && POD_HEALTHY_AT_TARGET=$((POD_HEALTHY_AT_TARGET + 1))
     elif [[ "$version" =~ ^[0-9]+$ ]] && [[ "$target" =~ ^[0-9]+$ ]]; then
       if [ "$version" -lt "$target" ]; then POD_BEHIND=$((POD_BEHIND + 1)); else POD_AHEAD=$((POD_AHEAD + 1)); fi
     fi
@@ -289,6 +260,11 @@ run_probe() {
     printf 'parsed replicas (running/desired): %s\n' "$(replica_counts "$ps_json")"
   else
     printf 'FAILED to read ps - check `gigalixir ps -a %s` by hand\n' "$APP"
+  fi
+
+  if [ "$HTTP_CHECK" -eq 1 ]; then
+    if http_ok; then printf 'http: %s returned %s\n' "$URL" "$EXPECT_STATUS"
+    else printf 'http: %s did NOT return %s\n' "$URL" "$EXPECT_STATUS"; fi
   fi
 
   printf '\nIf any "parsed" line above is empty but the raw JSON has the data,\nadjust the JQ_* expressions near the top of this script.\n'
@@ -349,10 +325,10 @@ wait_for_converge() {
 
 # Phase C -------------------------------------------------------------------------------
 # A pod dropping to an older release is unambiguous - Gigalixir rolled us back - so that
-# fails on sight. Anything else (a single pod restarting, an API blip) gets
-# --flap-tolerance consecutive polls to recover before it counts as a failure.
+# fails on sight. Anything else (a single pod restarting, an API blip, one bad HTTP probe)
+# gets --flap-tolerance consecutive polls to recover before it counts as a failure.
 watch_stability() {
-  local deadline=$((SECONDS + STABLE_WINDOW)) strikes=0 last_log=0
+  local deadline=$((SECONDS + STABLE_WINDOW)) strikes=0 http_strikes=0 last_log=0
 
   log "phase C: holding v${TARGET_VERSION} for ${STABLE_WINDOW}s to prove it does not roll back"
   while [ "$SECONDS" -lt "$deadline" ]; do
@@ -385,7 +361,17 @@ watch_stability() {
       continue
     fi
 
-    strikes=0
+    if ! http_ok; then
+      http_strikes=$((http_strikes + 1))
+      log "  ${URL} not returning ${EXPECT_STATUS} (${http_strikes}/${FLAP_TOLERANCE})"
+      [ "$http_strikes" -ge "$FLAP_TOLERANCE" ] && {
+        log "phase C FAILED: ${URL} kept failing its health check while pods claimed healthy"
+        return "$E_HTTP"
+      }
+      continue
+    fi
+
+    strikes=0 http_strikes=0
     if [ $((SECONDS - last_log)) -ge 30 ]; then
       log "  stable, $((deadline - SECONDS))s remaining [$POD_SUMMARY]"
       last_log=$SECONDS
@@ -406,7 +392,7 @@ main() {
     exit "$E_OK"
   fi
 
-  log "app=${APP} sha=${SHA:0:7}"
+  log "app=${APP} sha=${SHA:0:7} url=${URL} http_check=$([ "$HTTP_CHECK" -eq 1 ] && echo on || echo off)"
   log "budget: up to $((RELEASE_TIMEOUT + CONVERGE_TIMEOUT + STABLE_WINDOW))s total"
 
   local rc
@@ -414,9 +400,10 @@ main() {
   if [ "$rc" -eq "$E_OK" ]; then wait_for_converge; rc=$?; fi
   if [ "$rc" -eq "$E_OK" ]; then watch_stability; rc=$?; fi
 
+  local trailer="\`${APP}\` v${TARGET_VERSION:-?} (\`${SHA:0:7}\`${TARGET_APPVER:+, ${TARGET_APPVER}})"
   if [ "$rc" -eq "$E_OK" ]; then
     log "VERIFIED: ${APP} is live on release v${TARGET_VERSION} and stable"
-    notify ok
+    notify "✅ Deploy verified - ${trailer} live and stable for ${STABLE_WINDOW}s"
   else
     local reason
     case "$rc" in
@@ -424,13 +411,14 @@ main() {
       "$E_NO_CONVERGE") reason="pods never became healthy on the new release" ;;
       "$E_ROLLBACK") reason="ROLLED BACK to an older release" ;;
       "$E_UNHEALTHY") reason="pods went unhealthy after deploy" ;;
+      "$E_HTTP") reason="app not serving ${EXPECT_STATUS} at ${URL}" ;;
       "$E_SUPERSEDED") reason="superseded by another deploy" ;;
       *) reason="unknown failure" ;;
     esac
     log "DEPLOY VERIFICATION FAILED (${reason})"
-    log "investigate: gigalixir logs -a ${APP} ; gigalixir ps -a ${APP} ; gigalixir releases -a ${APP}"
+    log "investigate: gigalixir logs -a ${APP} | gigalixir ps -a ${APP} | gigalixir releases -a ${APP}"
     fail_annotation "${APP}: ${reason}"
-    notify fail "$reason"
+    notify "🚨 Deploy verification FAILED - ${trailer} - ${reason}"
   fi
   exit "$rc"
 }
