@@ -203,6 +203,12 @@ choose_version() {
     && die "tag v${NEW_VERSION} already exists locally"
 
   BRANCH="chore/bump-version-${NEW_VERSION}"
+  local suffix=2
+  while git rev-parse --verify --quiet "refs/heads/${BRANCH}" >/dev/null \
+        || git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; do
+    BRANCH="chore/bump-version-${NEW_VERSION}-${suffix}"
+    suffix=$((suffix + 1))
+  done
 }
 
 # Rewrites only the first version line, then proves exactly one file and one line
