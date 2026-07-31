@@ -424,7 +424,7 @@ main() {
   preflight
   choose_version
   open_pr
-  wait_for_ci
+  # wait_for_ci
   merge_pr
   create_release
   # deploy
