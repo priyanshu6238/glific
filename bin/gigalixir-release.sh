@@ -378,8 +378,8 @@ main() {
     log "no bump for ${ENV_NAME} - deploying current ${BASE_BRANCH} (${DEPLOY_SHA:0:7}) as ${CURRENT_VERSION}"
   fi
 
-  deploy
-  verify
+  # deploy
+  # verify
 }
 
 main "$@"
